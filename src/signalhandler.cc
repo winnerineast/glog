@@ -93,7 +93,7 @@ class MinimalFormatter {
   }
 
   // Returns the number of bytes written in the buffer.
-  int num_bytes_written() const { return cursor_ - buffer_; }
+  int num_bytes_written() const { return (int) (cursor_ - buffer_); }
 
   // Appends string from "str" and updates the internal cursor.
   void AppendString(const char* str) {
@@ -169,7 +169,7 @@ void DumpTimeInfo() {
   g_failure_writer(buf, formatter.num_bytes_written());
 }
 
-// TOOD(hamaji): Use signal instead of sigaction?
+// TODO(hamaji): Use signal instead of sigaction?
 #ifdef HAVE_SIGACTION
 
 // Dumps information about the signal to STDERR.

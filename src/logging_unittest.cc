@@ -273,7 +273,7 @@ void TestLogging(bool check_counts) {
              << setw(1) << hex << j;
 
   {
-    google::LogMessage outer(__FILE__, __LINE__, google::ERROR);
+    google::LogMessage outer(__FILE__, __LINE__, GLOG_ERROR);
     outer.stream() << "outer";
 
     LOG(ERROR) << "inner";
@@ -323,7 +323,7 @@ void TestRawLogging() {
   RAW_LOG(WARNING, "%s", s);
   const char const_s[] = "const array";
   RAW_LOG(INFO, "%s", const_s);
-  void* p = reinterpret_cast<void*>(0x12345678);
+  void* p = reinterpret_cast<void*>(PTR_TEST_VALUE);
   RAW_LOG(INFO, "ptr %p", p);
   p = NULL;
   RAW_LOG(INFO, "ptr %p", p);
@@ -572,9 +572,10 @@ void TestDCHECK() {
   DCHECK_GT(2, 1);
   DCHECK_LT(1, 2);
 
-  auto_ptr<int64> sptr(new int64);
-  int64* ptr = DCHECK_NOTNULL(sptr.get());
-  CHECK_EQ(ptr, sptr.get());
+  int64* orig_ptr = new int64;
+  int64* ptr = DCHECK_NOTNULL(orig_ptr);
+  CHECK_EQ(ptr, orig_ptr);
+  delete orig_ptr;
 }
 
 void TestSTREQ() {
@@ -1075,10 +1076,10 @@ TEST(Strerror, logging) {
 
 // Simple routines to look at the sizes of generated code for LOG(FATAL) and
 // CHECK(..) via objdump
-void MyFatal() {
+static void MyFatal() {
   LOG(FATAL) << "Failed";
 }
-void MyCheck(bool a, bool b) {
+static void MyCheck(bool a, bool b) {
   CHECK_EQ(a, b);
 }
 

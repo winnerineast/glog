@@ -183,7 +183,7 @@ GLOG_DEFINE_string(log_backtrace_at, "",
 
 #ifndef HAVE_PREAD
 #if defined(OS_WINDOWS)
-#include <BaseTsd.h>
+#include <basetsd.h>
 #define ssize_t SSIZE_T
 #endif
 static ssize_t pread(int fd, void* buf, size_t count, off_t offset) {
@@ -255,6 +255,9 @@ static bool TerminalSupportsColor() {
       !strcmp(term, "xterm-color") ||
       !strcmp(term, "xterm-256color") ||
       !strcmp(term, "screen-256color") ||
+      !strcmp(term, "konsole") ||
+      !strcmp(term, "konsole-16color") ||
+      !strcmp(term, "konsole-256color") ||
       !strcmp(term, "screen") ||
       !strcmp(term, "linux") ||
       !strcmp(term, "cygwin");
@@ -296,7 +299,7 @@ static GLogColor SeverityToColor(LogSeverity severity) {
 #ifdef OS_WINDOWS
 
 // Returns the character attribute for the given color.
-WORD GetColorAttribute(GLogColor color) {
+static WORD GetColorAttribute(GLogColor color) {
   switch (color) {
     case COLOR_RED:    return FOREGROUND_RED;
     case COLOR_GREEN:  return FOREGROUND_GREEN;
@@ -308,7 +311,7 @@ WORD GetColorAttribute(GLogColor color) {
 #else
 
 // Returns the ANSI color code for the given color.
-const char* GetAnsiColorCode(GLogColor color) {
+static const char* GetAnsiColorCode(GLogColor color) {
   switch (color) {
   case COLOR_RED:     return "1";
   case COLOR_GREEN:   return "2";
@@ -1150,8 +1153,16 @@ static LogMessage::LogMessageData fatal_msg_data_shared;
 // LogMessageData object exists (in this case glog makes zero heap memory
 // allocations).
 static GLOG_THREAD_LOCAL_STORAGE bool thread_data_available = true;
-static GLOG_THREAD_LOCAL_STORAGE char thread_msg_data[sizeof(LogMessage::LogMessageData)];
-#endif // defined(GLOG_THREAD_LOCAL_STORAGE)
+
+#ifdef HAVE_ALIGNED_STORAGE
+static GLOG_THREAD_LOCAL_STORAGE
+    std::aligned_storage<sizeof(LogMessage::LogMessageData),
+                         alignof(LogMessage::LogMessageData)>::type thread_msg_data;
+#else
+static GLOG_THREAD_LOCAL_STORAGE
+    char thread_msg_data[sizeof(void*) + sizeof(LogMessage::LogMessageData)];
+#endif  // HAVE_ALIGNED_STORAGE
+#endif  // defined(GLOG_THREAD_LOCAL_STORAGE)
 
 LogMessage::LogMessageData::LogMessageData()
   : stream_(message_text_, LogMessage::kMaxLogMessageLen, 0) {
@@ -1213,7 +1224,16 @@ void LogMessage::Init(const char* file,
     // No need for locking, because this is thread local.
     if (thread_data_available) {
       thread_data_available = false;
+#ifdef HAVE_ALIGNED_STORAGE
       data_ = new (&thread_msg_data) LogMessageData;
+#else
+      const uintptr_t kAlign = sizeof(void*) - 1;
+
+      char* align_ptr =
+          reinterpret_cast<char*>(reinterpret_cast<uintptr_t>(thread_msg_data + kAlign) & ~kAlign);
+      data_ = new (align_ptr) LogMessageData;
+      assert(reinterpret_cast<uintptr_t>(align_ptr) % sizeof(void*) == 0);
+#endif
     } else {
       allocated_ = new LogMessageData();
       data_ = allocated_;
@@ -1246,7 +1266,6 @@ void LogMessage::Init(const char* file,
   data_->timestamp_ = static_cast<time_t>(now);
   localtime_r(&data_->timestamp_, &data_->tm_time_);
   int usecs = static_cast<int>((now - data_->timestamp_) * 1000000);
-  RawLog__SetLastTime(data_->tm_time_, usecs);
 
   data_->num_chars_to_log_ = 0;
   data_->num_chars_to_syslog_ = 0;
@@ -1291,7 +1310,7 @@ void LogMessage::Init(const char* file,
 LogMessage::~LogMessage() {
   Flush();
 #ifdef GLOG_THREAD_LOCAL_STORAGE
-  if (data_ == static_cast<void*>(thread_msg_data)) {
+  if (data_ == static_cast<void*>(&thread_msg_data)) {
     data_->~LogMessageData();
     thread_data_available = true;
   }
@@ -1707,6 +1726,7 @@ void LogToStderr() {
 namespace base {
 namespace internal {
 
+bool GetExitOnDFatal();
 bool GetExitOnDFatal() {
   MutexLock l(&log_mutex);
   return exit_on_dfatal;
@@ -1722,6 +1742,7 @@ bool GetExitOnDFatal() {
 // and the stack trace is not recorded.  The LOG(FATAL) *will* still
 // exit the program.  Since this function is used only in testing,
 // these differences are acceptable.
+void SetExitOnDFatal(bool value);
 void SetExitOnDFatal(bool value) {
   MutexLock l(&log_mutex);
   exit_on_dfatal = value;

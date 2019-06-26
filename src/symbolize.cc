@@ -58,6 +58,7 @@
 
 #include <string.h>
 
+#include <algorithm>
 #include <limits>
 
 #include "symbolize.h"
@@ -136,17 +137,20 @@ _END_GOOGLE_NAMESPACE_
 
 _START_GOOGLE_NAMESPACE_
 
-// Read up to "count" bytes from file descriptor "fd" into the buffer
-// starting at "buf" while handling short reads and EINTR.  On
-// success, return the number of bytes read.  Otherwise, return -1.
-static ssize_t ReadPersistent(const int fd, void *buf, const size_t count) {
+// Read up to "count" bytes from "offset" in the file pointed by file
+// descriptor "fd" into the buffer starting at "buf" while handling short reads
+// and EINTR.  On success, return the number of bytes read.  Otherwise, return
+// -1.
+static ssize_t ReadFromOffset(const int fd, void *buf, const size_t count,
+                              const off_t offset) {
   SAFE_ASSERT(fd >= 0);
   SAFE_ASSERT(count <= std::numeric_limits<ssize_t>::max());
   char *buf0 = reinterpret_cast<char *>(buf);
   ssize_t num_bytes = 0;
   while (num_bytes < count) {
     ssize_t len;
-    NO_INTR(len = read(fd, buf0 + num_bytes, count - num_bytes));
+    NO_INTR(len = pread(fd, buf0 + num_bytes, count - num_bytes,
+                        offset + num_bytes));
     if (len < 0) {  // There was an error other than EINTR.
       return -1;
     }
@@ -157,18 +161,6 @@ static ssize_t ReadPersistent(const int fd, void *buf, const size_t count) {
   }
   SAFE_ASSERT(num_bytes <= count);
   return num_bytes;
-}
-
-// Read up to "count" bytes from "offset" in the file pointed by file
-// descriptor "fd" into the buffer starting at "buf".  On success,
-// return the number of bytes read.  Otherwise, return -1.
-static ssize_t ReadFromOffset(const int fd, void *buf,
-                              const size_t count, const off_t offset) {
-  off_t off = lseek(fd, offset, SEEK_SET);
-  if (off == (off_t)-1) {
-    return -1;
-  }
-  return ReadPersistent(fd, buf, count);
 }
 
 // Try reading exactly "count" bytes from "offset" bytes in a file
@@ -209,6 +201,9 @@ GetSectionHeaderByType(const int fd, ElfW(Half) sh_num, const off_t sh_offset,
         (sizeof(buf) > num_bytes_left) ? num_bytes_left : sizeof(buf);
     const ssize_t len = ReadFromOffset(fd, buf, num_bytes_to_read,
                                        sh_offset + i * sizeof(buf[0]));
+    if (len == -1) {
+      return false;
+    }
     SAFE_ASSERT(len % sizeof(buf[0]) == 0);
     const ssize_t num_headers_in_buf = len / sizeof(buf[0]);
     SAFE_ASSERT(num_headers_in_buf <= sizeof(buf) / sizeof(buf[0]));
@@ -298,10 +293,12 @@ FindSymbol(uint64_t pc, const int fd, char *out, int out_size,
 
     // Read at most NUM_SYMBOLS symbols at once to save read() calls.
     ElfW(Sym) buf[NUM_SYMBOLS];
-    const ssize_t len = ReadFromOffset(fd, &buf, sizeof(buf), offset);
+    int num_symbols_to_read = std::min(NUM_SYMBOLS, num_symbols - i);
+    const ssize_t len =
+        ReadFromOffset(fd, &buf, sizeof(buf[0]) * num_symbols_to_read, offset);
     SAFE_ASSERT(len % sizeof(buf[0]) == 0);
     const ssize_t num_symbols_in_buf = len / sizeof(buf[0]);
-    SAFE_ASSERT(num_symbols_in_buf <= sizeof(buf)/sizeof(buf[0]));
+    SAFE_ASSERT(num_symbols_in_buf <= num_symbols_to_read);
     for (int j = 0; j < num_symbols_in_buf; ++j) {
       const ElfW(Sym)& symbol = buf[j];
       uint64_t start_address = symbol.st_value;
@@ -392,9 +389,14 @@ struct FileDescriptor {
 // and snprintf().
 class LineReader {
  public:
-  explicit LineReader(int fd, char *buf, int buf_len) : fd_(fd),
-    buf_(buf), buf_len_(buf_len), bol_(buf), eol_(buf), eod_(buf) {
-  }
+  explicit LineReader(int fd, char *buf, int buf_len, off_t offset)
+      : fd_(fd),
+        buf_(buf),
+        buf_len_(buf_len),
+        offset_(offset),
+        bol_(buf),
+        eol_(buf),
+        eod_(buf) {}
 
   // Read '\n'-terminated line from file.  On success, modify "bol"
   // and "eol", then return true.  Otherwise, return false.
@@ -403,10 +405,11 @@ class LineReader {
   // dropped.  It's an intentional behavior to make the code simple.
   bool ReadLine(const char **bol, const char **eol) {
     if (BufferIsEmpty()) {  // First time.
-      const ssize_t num_bytes = ReadPersistent(fd_, buf_, buf_len_);
+      const ssize_t num_bytes = ReadFromOffset(fd_, buf_, buf_len_, offset_);
       if (num_bytes <= 0) {  // EOF or error.
         return false;
       }
+      offset_ += num_bytes;
       eod_ = buf_ + num_bytes;
       bol_ = buf_;
     } else {
@@ -419,11 +422,12 @@ class LineReader {
         // Read text from file and append it.
         char * const append_pos = buf_ + incomplete_line_length;
         const int capacity_left = buf_len_ - incomplete_line_length;
-        const ssize_t num_bytes = ReadPersistent(fd_, append_pos,
-                                                 capacity_left);
+        const ssize_t num_bytes =
+            ReadFromOffset(fd_, append_pos, capacity_left, offset_);
         if (num_bytes <= 0) {  // EOF or error.
           return false;
         }
+        offset_ += num_bytes;
         eod_ = append_pos + num_bytes;
         bol_ = buf_;
       }
@@ -468,6 +472,7 @@ class LineReader {
   const int fd_;
   char * const buf_;
   const int buf_len_;
+  off_t offset_;
   char *bol_;
   char *eol_;
   const char *eod_;  // End of data in "buf_".
@@ -526,7 +531,7 @@ OpenObjectFileContainingPcAndGetStartAddress(uint64_t pc,
   // look into the symbol tables inside.
   char buf[1024];  // Big enough for line of sane /proc/self/maps
   int num_maps = 0;
-  LineReader reader(wrapped_maps_fd.get(), buf, sizeof(buf));
+  LineReader reader(wrapped_maps_fd.get(), buf, sizeof(buf), 0);
   while (true) {
     num_maps++;
     const char *cursor;
@@ -662,7 +667,7 @@ OpenObjectFileContainingPcAndGetStartAddress(uint64_t pc,
 // bytes. Output will be truncated as needed, and a NUL character is always
 // appended.
 // NOTE: code from sandbox/linux/seccomp-bpf/demo.cc.
-char *itoa_r(intptr_t i, char *buf, size_t sz, int base, size_t padding) {
+static char *itoa_r(intptr_t i, char *buf, size_t sz, int base, size_t padding) {
   // Make sure we can write at least one NUL byte.
   size_t n = 1;
   if (n > sz)
@@ -679,7 +684,8 @@ char *itoa_r(intptr_t i, char *buf, size_t sz, int base, size_t padding) {
 
   // Handle negative numbers (only for base 10).
   if (i < 0 && base == 10) {
-    j = -i;
+    // This does "j = -i" while avoiding integer overflow.
+    j = static_cast<uintptr_t>(-(i + 1)) + 1;
 
     // Make sure we can write the '-' character.
     if (++n > sz) {
@@ -724,7 +730,7 @@ char *itoa_r(intptr_t i, char *buf, size_t sz, int base, size_t padding) {
 
 // Safely appends string |source| to string |dest|.  Never writes past the
 // buffer size |dest_size| and guarantees that |dest| is null-terminated.
-void SafeAppendString(const char* source, char* dest, int dest_size) {
+static void SafeAppendString(const char* source, char* dest, int dest_size) {
   int dest_string_length = strlen(dest);
   SAFE_ASSERT(dest_string_length < dest_size);
   dest += dest_string_length;
@@ -737,7 +743,7 @@ void SafeAppendString(const char* source, char* dest, int dest_size) {
 // Converts a 64-bit value into a hex string, and safely appends it to |dest|.
 // Never writes past the buffer size |dest_size| and guarantees that |dest| is
 // null-terminated.
-void SafeAppendHexNumber(uint64_t value, char* dest, int dest_size) {
+static void SafeAppendHexNumber(uint64_t value, char* dest, int dest_size) {
   // 64-bit numbers in hex can have up to 16 digits.
   char buf[17] = {'\0'};
   SafeAppendString(itoa_r(value, buf, sizeof(buf), 16, 0), dest, dest_size);
@@ -775,8 +781,13 @@ static ATTRIBUTE_NOINLINE bool SymbolizeAndDemangle(void *pc, char *out,
                                                              out_size - 1);
   }
 
+#if defined(PRINT_UNSYMBOLIZED_STACK_TRACES)
+  {
+    FileDescriptor wrapped_object_fd(object_fd);
+#else
   // Check whether a file name was returned.
   if (object_fd < 0) {
+#endif
     if (out[1]) {
       // The object file containing PC was determined successfully however the
       // object file was not opened successfully.  This is still considered
@@ -800,7 +811,7 @@ static ATTRIBUTE_NOINLINE bool SymbolizeAndDemangle(void *pc, char *out,
     // Run the call back if it's installed.
     // Note: relocation (and much of the rest of this code) will be
     // wrong for prelinked shared libraries and PIE executables.
-    uint64 relocation = (elf_type == ET_DYN) ? start_address : 0;
+    uint64_t relocation = (elf_type == ET_DYN) ? start_address : 0;
     int num_bytes_written = g_symbolize_callback(wrapped_object_fd.get(),
                                                  pc, out, out_size,
                                                  relocation);
@@ -844,18 +855,22 @@ static ATTRIBUTE_NOINLINE bool SymbolizeAndDemangle(void *pc, char *out,
 
 _END_GOOGLE_NAMESPACE_
 
-#elif defined(OS_WINDOWS)
+#elif defined(OS_WINDOWS) || defined(OS_CYGWIN)
 
-#include <DbgHelp.h>
-#pragma comment(lib, "DbgHelp")
+#include <windows.h>
+#include <dbghelp.h>
+
+#ifdef _MSC_VER
+#pragma comment(lib, "dbghelp")
+#endif
 
 _START_GOOGLE_NAMESPACE_
 
 class SymInitializer {
 public:
-  HANDLE process = NULL;
-  bool ready = false;
-  SymInitializer() {
+  HANDLE process;
+  bool ready;
+  SymInitializer() : process(NULL), ready(false) {
     // Initialize the symbol handler.
     // https://msdn.microsoft.com/en-us/library/windows/desktop/ms680344(v=vs.85).aspx
     process = GetCurrentProcess();
